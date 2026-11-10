@@ -8,76 +8,186 @@ on:
     branches:
       - main
   schedule:
-    - cron: "0 0 * * *"
+    - cron: "0 12 * * *"
+
+concurrency:
+  cancel-in-progress: true
+  group: validate-${{ github.ref }}
+
+permissions: {}
 
 jobs:
+  preflight:
+    if: ${{ github.repository == 'hacs/integration' }}
+    runs-on: ubuntu-26.04
+    name: Preflight
+    steps:
+      - name: Validation preflight
+        env:
+          ACTOR: ${{ github.actor }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+        run: |
+          echo "**Start:** $(date)" >> $GITHUB_STEP_SUMMARY
+          echo "**Actor:** $ACTOR" >> $GITHUB_STEP_SUMMARY
+          echo "**Event:** $EVENT_NAME" >> $GITHUB_STEP_SUMMARY
+          echo "**Ref name:** $REF_NAME" >> $GITHUB_STEP_SUMMARY
+          echo "**Ref:** $REF" >> $GITHUB_STEP_SUMMARY
+          echo "**SHA:** $SHA" >> $GITHUB_STEP_SUMMARY
+
   validate-hassfest:
-    runs-on: ubuntu-latest
+    needs:
+      - "preflight"
+    runs-on: ubuntu-26.04
     name: With hassfest
     steps:
-    - name: Check out repository
-      uses: actions/checkout@v2
+      - name: Checkout the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-    - name: Hassfest validation
-      uses: "home-assistant/actions/hassfest@master"
+      # Test files conflict with running hassfest
+      - name: Remove tests
+        run: rm -rf tests
 
-    - name: Discord notification
-      if: ${{ github.event_name == 'schedule' && failure() }}
-      env:
-        DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_ACTION_FAILURE }}
-      uses: Ilshidur/action-discord@0.3.2
-      with:
-        args: "[Scheduled action failed!](https://github.com/${{github.repository}}/actions/runs/${{github.run_id}})"
+      # Since 2026.10, hassfest rejects aiogithubapi in the manifest because Home Assistant
+      # itself depends on it. The min supported version doesn't, so it has to stay listed.
+      - name: Hassfest validation
+        run: |
+          docker run --rm -v "${GITHUB_WORKSPACE}:/github/workspace" \
+            ghcr.io/home-assistant/hassfest:2026.9.4@sha256:cf7088cd0eaf291024165629853a1853f1a9fc2652b74141c5ed133499738760
 
   validate-hacs:
-    runs-on: ubuntu-latest
+    needs:
+      - "preflight"
+    runs-on: ubuntu-26.04
     name: With HACS Action
     steps:
-    - name: Check out repository
-      uses: actions/checkout@v2
+      - name: HACS validation
+        uses: hacs/action@1ebf01c408f29afcb6406bd431bc98fd8cbb15aa # main
+        with:
+          category: integration
 
-    - name: HACS validation
-      uses: hacs/action@main
-      with:
-        category: integration
-        comment: false
-
-    - name: Discord notification
-      if: ${{ github.event_name == 'schedule' && failure() }}
-      env:
-        DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_ACTION_FAILURE }}
-      uses: Ilshidur/action-discord@0.3.2
-      with:
-        args: "[Scheduled action failed!](https://github.com/${{github.repository}}/actions/runs/${{github.run_id}})"
-
-  validate-homeassistant:
-    name: With Home Assistant
+  validate-hacs-local:
+    if: ${{ github.event_name != 'schedule' }}
+    needs:
+      - "preflight"
+    runs-on: ubuntu-26.04
+    name: Check ${{matrix.entry.category}} ${{matrix.entry.repository}} with HACS Action (local)
     strategy:
       matrix:
-        channel: [stable, beta, dev]
-    runs-on: ubuntu-latest
+        entry:
+          - repository: "hacs/integration"
+            category: "integration"
+          - repository: "piitaya/lovelace-mushroom"
+            category: "plugin"
     steps:
-      - name: 📥 Checkout the repository
-        uses: actions/checkout@v2
+      - name: Checkout the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: 📋 Copy sample configuration for Home Assistant
+      - name: Build Container
         run: |
-          mkdir ./test_configuration
-          cp -f .devcontainer/sample_configuration.yaml ./test_configuration/configuration.yaml
-          cp -r ./custom_components ./test_configuration
-          sed -i 's/#//g' ./test_configuration/configuration.yaml
+          docker build . -t hacs/action:local -f action/Dockerfile
 
-      - name: 👷 Setup Home Assistant
-        id: homeassistant
-        uses: ludeeus/setup-homeassistant@main
+      - name: Run Action
+        run: |
+          docker run --name hacs_action_local \
+            --env INPUT_GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }} \
+            --env INPUT_REPOSITORY=${{matrix.entry.repository}} \
+            --env INPUT_CATEGORY=${{matrix.entry.category}} \
+            hacs/action:local
+
+  validata-hacs-data:
+    if: ${{ github.event_name != 'schedule' }}
+    needs:
+      - "preflight"
+    runs-on: ubuntu-26.04
+    name: Check ${{matrix.entry.category}} ${{matrix.entry.repository}} with HACS data generation
+    strategy:
+      matrix:
+        entry:
+          - repository: "hacs/integration"
+            category: "integration"
+          - repository: "piitaya/lovelace-mushroom"
+            category: "plugin"
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          tag: ${{ matrix.channel }}
-          config-dir: test_configuration
+          persist-credentials: false
 
-      - name: Discord notification
-        if: ${{ github.event_name == 'schedule' && failure() }}
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version-file: .python-version
+          cache: 'pip'
+          cache-dependency-path: |
+            requirements_base.txt
+            requirements_generate_data.txt
+
+      - name: Install dependencies
+        run:  |
+          scripts/install/pip_packages --requirement requirements_generate_data.txt
+
+      - name: Generate data
+        run: |
+          python3 -m scripts.data.generate_category_data \
+            ${{ matrix.entry.category }} \
+            ${{ matrix.entry.repository }}
         env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_ACTION_FAILURE }}
-        uses: Ilshidur/action-discord@0.3.2
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate diff
+        run: |
+          diff -U 8 outputdata/diff/${{ matrix.entry.category }}_before.json outputdata/diff/${{ matrix.entry.category }}_after.json > outputdata/diff/${{ matrix.entry.category }}.diff || true
+          cat outputdata/diff/${{ matrix.entry.category }}.diff
+
+      - name: Upload diff
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          CATEGORY: ${{ matrix.entry.category }}
         with:
-          args: "[Scheduled action failed!](https://github.com/${{github.repository}}/actions/runs/${{github.run_id}})"
+          script: |
+            const fs = require('fs');
+            const diffContents = fs.readFileSync(`outputdata/diff/${process.env.CATEGORY}.diff`);
+
+            core.summary.addDetails(`${process.env.CATEGORY}.diff contents`, `\n\n\`\`\`diff\n${diffContents}\`\`\`\n\n`)
+            core.summary.write()
+
+      - name: Validate output with JQ
+        run: |
+          jq -c . outputdata/${{ matrix.entry.category }}/data.json
+          jq -c . outputdata/${{ matrix.entry.category }}/repositories.json
+
+      - name: Validate output with schema
+        run: |
+          python3 -m scripts.data.validate_category_data ${{  matrix.entry.category }} outputdata/${{ matrix.entry.category }}/data.json
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: "${{ matrix.entry.category }}_${{ strategy.job-index }}"
+          path: |
+            outputdata/summary.json
+            outputdata/${{ matrix.entry.category }}
+            outputdata/diff
+          if-no-files-found: error
+          retention-days: 3
+
+
+  notify_on_failure:
+    runs-on: ubuntu-26.04
+    name: Trigger Discord notification when jobs fail
+    needs: ["preflight","validate-hassfest", "validate-hacs"]
+    steps:
+      - name: Send notification
+        if: ${{ always() && contains(join(needs.*.result, ','), 'failure') && github.event_name == 'schedule' }}
+        run: |
+          curl \
+            -H "Content-Type: application/json" \
+            -d '{"username": "GitHub action failure", "content": "[Scheduled action failed!](https://github.com/${{github.repository}}/actions/runs/${{github.run_id}})"}' \
+            ${{ secrets.DISCORD_WEBHOOK_ACTION_FAILURE }}

@@ -1,0 +1,464 @@
+name: Generate HACS Data
+
+on:
+  workflow_dispatch:
+    inputs:
+      forceRepositoryUpdate:
+        description: 'Force repository update'
+        required: false
+        default: 'False'
+        type: choice
+        options:
+          - "False"
+          - "True"
+      category:
+        description: 'Select a category'
+        required: false
+        type: choice
+        options:
+          - None
+          - appdaemon
+          - integration
+          - plugin
+          - python_script
+          - template
+          - theme
+      dryRun:
+        description: 'Dry run (generate and summarize only, do not publish)'
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: "0 */4 * * *"
+
+concurrency:
+  group: category-data
+
+permissions: {}
+
+jobs:
+  generate-matrix:
+    name: Generate matrix
+    runs-on: ubuntu-26.04
+    if: github.repository == 'hacs/integration'
+    outputs:
+      categories: ${{ steps.set-matrix.outputs.categories }}
+    steps:
+      - id: set-matrix
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_CATEGORY: ${{ inputs.category }}
+        run: |
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]] && [[ "$INPUT_CATEGORY" != "None" ]] && [[ -n "$INPUT_CATEGORY" ]]; then
+            categories=("$INPUT_CATEGORY")
+          else
+            categories=(appdaemon integration plugin python_script template theme)
+          fi
+          categories_json=$(printf '%s\n' "${categories[@]}" | jq -R . | jq -cs .)
+          echo "categories=$categories_json" >> $GITHUB_OUTPUT
+          echo "categories: $categories_json"
+
+  settings:
+    name: Load settings
+    runs-on: ubuntu-26.04
+    if: github.repository == 'hacs/integration'
+    environment: data-generator
+    outputs:
+      shard_size: ${{ steps.settings.outputs.shard_size }}
+      max_parallel: ${{ steps.settings.outputs.max_parallel }}
+      update_repository_concurrent_tasks: ${{ steps.settings.outputs.update_repository_concurrent_tasks }}
+      update_repository_backoff_time_seconds: ${{ steps.settings.outputs.update_repository_backoff_time_seconds }}
+      repository_refresh_interval_days: ${{ steps.settings.outputs.repository_refresh_interval_days }}
+    steps:
+      - name: Load settings
+        id: settings
+        env:
+          SHARD_SIZE: ${{ vars.HACS_DATA_GENERATOR_SHARD_SIZE }}
+          MAX_PARALLEL: ${{ vars.HACS_DATA_GENERATOR_MAX_PARALLEL }}
+          UPDATE_REPOSITORY_CONCURRENT_TASKS: ${{ vars.HACS_DATA_GENERATOR_UPDATE_REPOSITORY_CONCURRENT_TASKS }}
+          UPDATE_REPOSITORY_BACKOFF_TIME_SECONDS: ${{ vars.HACS_DATA_GENERATOR_UPDATE_REPOSITORY_BACKOFF_TIME_SECONDS }}
+          REPOSITORY_REFRESH_INTERVAL_DAYS: ${{ vars.HACS_DATA_GENERATOR_REPOSITORY_REFRESH_INTERVAL_DAYS }}
+        run: |
+          # A smaller shard size risks exceeding the 256-job matrix limit.
+          [[ "$SHARD_SIZE" =~ ^[1-9][0-9]*$ ]] && (( SHARD_SIZE >= 100 )) || { echo "::error::HACS_DATA_GENERATOR_SHARD_SIZE must be an integer of at least 100"; exit 1; }
+          [[ "$MAX_PARALLEL" =~ ^[1-9][0-9]*$ ]] || { echo "::error::HACS_DATA_GENERATOR_MAX_PARALLEL must be a positive integer"; exit 1; }
+          [[ "$UPDATE_REPOSITORY_CONCURRENT_TASKS" =~ ^[1-9][0-9]*$ ]] || { echo "::error::HACS_DATA_GENERATOR_UPDATE_REPOSITORY_CONCURRENT_TASKS must be a positive integer"; exit 1; }
+          [[ "$UPDATE_REPOSITORY_BACKOFF_TIME_SECONDS" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "::error::HACS_DATA_GENERATOR_UPDATE_REPOSITORY_BACKOFF_TIME_SECONDS must be a non-negative number"; exit 1; }
+          [[ "$REPOSITORY_REFRESH_INTERVAL_DAYS" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "::error::HACS_DATA_GENERATOR_REPOSITORY_REFRESH_INTERVAL_DAYS must be a non-negative number"; exit 1; }
+          echo "shard_size=$SHARD_SIZE" >> "$GITHUB_OUTPUT"
+          echo "max_parallel=$MAX_PARALLEL" >> "$GITHUB_OUTPUT"
+          echo "update_repository_concurrent_tasks=$UPDATE_REPOSITORY_CONCURRENT_TASKS" >> "$GITHUB_OUTPUT"
+          echo "update_repository_backoff_time_seconds=$UPDATE_REPOSITORY_BACKOFF_TIME_SECONDS" >> "$GITHUB_OUTPUT"
+          echo "repository_refresh_interval_days=$REPOSITORY_REFRESH_INTERVAL_DAYS" >> "$GITHUB_OUTPUT"
+          {
+            echo "| Setting | Value |"
+            echo "| --- | --- |"
+            echo "| \`HACS_DATA_GENERATOR_SHARD_SIZE\` | $SHARD_SIZE |"
+            echo "| \`HACS_DATA_GENERATOR_MAX_PARALLEL\` | $MAX_PARALLEL |"
+            echo "| \`HACS_DATA_GENERATOR_UPDATE_REPOSITORY_CONCURRENT_TASKS\` | $UPDATE_REPOSITORY_CONCURRENT_TASKS |"
+            echo "| \`HACS_DATA_GENERATOR_UPDATE_REPOSITORY_BACKOFF_TIME_SECONDS\` | $UPDATE_REPOSITORY_BACKOFF_TIME_SECONDS |"
+            echo "| \`HACS_DATA_GENERATOR_REPOSITORY_REFRESH_INTERVAL_DAYS\` | $REPOSITORY_REFRESH_INTERVAL_DAYS |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Fetches the published data and checks out hacs/default once so every
+  # category leg uses the same baseline. Trade-off: if any fetch keeps
+  # failing, this job fails and blocks the whole run, not just that category.
+  fetch-stored-data:
+    name: Fetch stored data
+    runs-on: ubuntu-26.04
+    needs: [generate-matrix, settings]
+    if: github.repository == 'hacs/integration'
+    timeout-minutes: 10
+    outputs:
+      shards: ${{ steps.fetch.outputs.shards }}
+      shard_counts: ${{ steps.fetch.outputs.shard_counts }}
+    steps:
+      - name: Checkout hacs/default
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: hacs/default
+          path: hacs-default
+          persist-credentials: false
+
+      - name: Fetch stored data
+        id: fetch
+        env:
+          CATEGORIES: ${{ needs.generate-matrix.outputs.categories }}
+          SHARD_SIZE: ${{ needs.settings.outputs.shard_size }}
+        run: |
+          mkdir -p outputdata/stored
+
+          fetch_stored_hacs_content() {
+            curl \
+              --silent --show-error --fail --retry 5 --retry-all-errors \
+              --connect-timeout 10 --max-time 60 \
+              --header "User-Agent: HACS/Generator" \
+              "https://data-v2.hacs.xyz/$1" \
+              --output "$2"
+          }
+
+          # Repositories are assigned to shards by a hash of their name, so shard
+          # sizes spread around the average and land up to about 6% above SHARD_SIZE.
+          shards="[]"
+          shard_counts="{}"
+          for category in $(echo "$CATEGORIES" | jq -r '.[]'); do
+            echo "Fetching stored data for $category"
+            fetch_stored_hacs_content "${category}/data.json" "outputdata/stored/${category}.json"
+            jq -e 'type == "array"' "hacs-default/${category}" > /dev/null || { echo "::error::hacs/default ${category} is not a JSON array"; exit 1; }
+            cp "hacs-default/${category}" "outputdata/stored/default-${category}.json"
+
+            count=$(jq 'length' "outputdata/stored/${category}.json")
+            total=$(( count > 0 ? (count + SHARD_SIZE - 1) / SHARD_SIZE : 1 ))
+            echo "$category: $count repositories in $total shard(s)"
+            shards=$(jq -c --arg category "$category" --argjson total "$total" \
+              '. + [range(1; $total + 1) | {category: $category, shard: ., shards: $total}]' <<< "$shards")
+            shard_counts=$(jq -c --arg category "$category" --argjson total "$total" \
+              '. + {($category): $total}' <<< "$shard_counts")
+          done
+          echo "shards=$shards" >> "$GITHUB_OUTPUT"
+          echo "shard_counts=$shard_counts" >> "$GITHUB_OUTPUT"
+
+          echo "Fetching removed repositories"
+          fetch_stored_hacs_content "removed/repositories.json" "outputdata/stored/removed.json"
+
+      - name: Upload stored data
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: stored-data
+          path: outputdata/stored
+          if-no-files-found: error
+          retention-days: 1
+
+  category-data:
+    runs-on: ubuntu-26.04
+    needs: [generate-matrix, settings, fetch-stored-data]
+    if: github.repository == 'hacs/integration'
+    name: Generate ${{ matrix.category }} data (${{ matrix.shard }}/${{ matrix.shards }})
+    environment: data-generator
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(needs.settings.outputs.max_parallel) }}
+      matrix:
+        include: ${{ fromJSON( needs.fetch-stored-data.outputs.shards )}}
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: ./.github/actions/setup-python
+        with:
+          requirements: requirements_generate_data.txt
+
+      - name: Download stored data
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: stored-data
+          path: outputdata/stored
+
+      - name: Generate ${{ matrix.category }} data (${{ matrix.shard }}/${{ matrix.shards }})
+        run: python3 -m scripts.data.generate_category_data ${{ matrix.category }} --shard ${{ matrix.shard }}/${{ matrix.shards }}
+        env:
+          DATA_GENERATOR_TOKEN: ${{ github.token }}
+          FORCE_REPOSITORY_UPDATE: ${{ inputs.forceRepositoryUpdate }}
+          HACS_STORED_DATA_DIR: outputdata/stored
+          HACS_DATA_GENERATOR_UPDATE_REPOSITORY_CONCURRENT_TASKS: ${{ needs.settings.outputs.update_repository_concurrent_tasks }}
+          HACS_DATA_GENERATOR_UPDATE_REPOSITORY_BACKOFF_TIME_SECONDS: ${{ needs.settings.outputs.update_repository_backoff_time_seconds }}
+          HACS_DATA_GENERATOR_REPOSITORY_REFRESH_INTERVAL_DAYS: ${{ needs.settings.outputs.repository_refresh_interval_days }}
+
+      - name: Upload shard data
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: shard-${{ matrix.category }}-${{ matrix.shard }}
+          path: outputdata/_shards/${{ matrix.category }}
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    runs-on: ubuntu-26.04
+    needs: [generate-matrix, settings, fetch-stored-data, category-data]
+    if: ${{ !cancelled() && needs.fetch-stored-data.result == 'success' && github.repository == 'hacs/integration' }}
+    name: Merge ${{ matrix.category }} data
+    environment: data-generator
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        category: ${{ fromJSON( needs.generate-matrix.outputs.categories )}}
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: ./.github/actions/setup-python
+        with:
+          requirements: requirements_generate_data.txt
+
+      - name: Download stored data
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: stored-data
+          path: outputdata/stored
+
+      - name: Download shard data
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: shard-${{ matrix.category }}-*
+          path: outputdata/_shards/${{ matrix.category }}
+          merge-multiple: true
+
+      - name: Merge ${{ matrix.category }} data
+        run: python3 -m scripts.data.merge_category_data ${{ matrix.category }} --shards ${{ fromJSON(needs.fetch-stored-data.outputs.shard_counts)[matrix.category] }}
+        env:
+          DATA_GENERATOR_TOKEN: ${{ github.token }}
+          HACS_STORED_DATA_DIR: outputdata/stored
+          HACS_DATA_GENERATOR_REPOSITORY_REFRESH_INTERVAL_DAYS: ${{ needs.settings.outputs.repository_refresh_interval_days }}
+
+      - name: Validate output with JQ
+        run: |
+          jq -c . outputdata/${{ matrix.category }}/data.json
+          jq -c . outputdata/${{ matrix.category }}/repositories.json
+
+      - name: Validate output with schema
+        run: |
+          python3 -m scripts.data.validate_category_data ${{ matrix.category }} outputdata/${{ matrix.category }}/data.json
+
+      - name: Generate diff
+        run: |
+          diff -U 8 outputdata/diff/${{ matrix.category }}_before.json outputdata/diff/${{ matrix.category }}_after.json > outputdata/diff/${{ matrix.category }}.diff || true
+          cat outputdata/diff/${{ matrix.category }}.diff
+
+      - name: Upload diff
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          CATEGORY: ${{ matrix.category }}
+        with:
+          script: |
+            const fs = require('fs');
+            const diffContents = fs.readFileSync(`outputdata/diff/${process.env.CATEGORY}.diff`);
+
+            core.summary.addDetails(`${process.env.CATEGORY}.diff contents`, `\n\n\`\`\`diff\n${diffContents}\`\`\`\n\n`)
+            core.summary.write()
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.category }}
+          path: |
+            outputdata/${{ matrix.category }}
+            outputdata/summary.json
+            outputdata/diff
+          if-no-files-found: error
+          retention-days: 7
+
+  summarize:
+    name: Summarize
+    runs-on: ubuntu-26.04
+    needs: [generate-matrix, merge]
+    if: ${{ always() && github.repository == 'hacs/integration' }}
+    outputs:
+      changedCategories: ${{ steps.combined.outputs.changedCategories }}
+      environments: ${{ steps.combined.outputs.environments }}
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: outputdata
+
+      - name: Generate combined summary
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        id: combined
+        env:
+          HACS_CHANGED_PCT_TARGET: ${{ vars.HACS_CHANGED_PCT_TARGET }}
+          HACS_DIFF_TARGET: ${{ vars.HACS_DIFF_TARGET }}
+          CATEGORIES: ${{ needs.generate-matrix.outputs.categories }}
+        with:
+          script: |
+            const fs = require('fs');
+            const summaries = {};
+            const changedCategories = [];
+            const environments = {};
+            const diffTarget = Number(process.env.HACS_DIFF_TARGET || 1)
+
+            core.info(`[global] diffTarget: ${diffTarget}`);
+
+            // Only consider the expected category directories that produced a
+            // summary -- ignores the stored-data artifact and any category
+            // whose leg failed to write one.
+            const categories = JSON.parse(process.env.CATEGORIES);
+            const subDirectories = categories.filter(
+                category => fs.existsSync(`outputdata/${category}/summary.json`)
+            )
+
+            for (const directory of subDirectories) {
+              let changedPctTarget = Number(process.env.HACS_CHANGED_PCT_TARGET)
+              const parsed = JSON.parse(fs.readFileSync(`outputdata/${directory}/summary.json`))
+
+              if (!changedPctTarget) {
+                if (!parsed.new_count || parsed.new_count <= 0) {
+                  changedPctTarget = 0;
+                } else if (directory === "integration") {
+                    changedPctTarget = 10;
+                } else if (parsed.new_count > 750) {
+                    changedPctTarget = 7;
+                } else if (parsed.new_count > 500) {
+                    changedPctTarget = 8;
+                } else if (parsed.new_count > 250) {
+                    changedPctTarget = 9;
+                } else if (parsed.new_count > 100) {
+                    changedPctTarget = 10;
+                } else if (parsed.new_count > 75) {
+                    changedPctTarget = 15;
+                } else if (parsed.new_count > 50) {
+                    changedPctTarget = 20;
+                } else if (parsed.new_count > 25) {
+                    changedPctTarget = 25;
+                } else if (parsed.new_count > 10) {
+                    changedPctTarget = 28;
+                } else {
+                    changedPctTarget = 50;
+                }
+              }
+
+              core.info(`[${directory}] changedPctTarget: ${changedPctTarget}`);
+
+              if (parsed.changed >= 1 || parsed.diff >= 1 || parsed.refreshed >= 1) {
+                changedCategories.push(directory)
+              }
+
+              if (parsed.changed_pct >= changedPctTarget) {
+                core.warning(`${directory} changed ${parsed.changed_pct}%!`)
+                environments[directory] = `publish-${directory}-verify`;
+              }
+
+              if (parsed.diff >= diffTarget) {
+                core.warning(`${directory} changed ${parsed.diff}!`)
+                environments[directory] = `publish-${directory}-verify`;
+              }
+
+              summaries[directory] = JSON.parse(fs.readFileSync(`outputdata/${directory}/summary.json`));
+            }
+
+            core.summary.addCodeBlock(JSON.stringify({summaries, environments, changedCategories}, null, 4), "json")
+            core.summary.write()
+            core.setOutput("changedCategories", JSON.stringify(changedCategories))
+            core.setOutput("environments", environments)
+
+      - name: Send notification
+        if: ${{ steps.combined.outputs.environments != '{}' }}
+        run: |
+          curl \
+            -H "Content-Type: application/json" \
+            -d '{"username": "GitHub action", "content": "[Attention needed!](https://github.com/${{github.repository}}/actions/runs/${{github.run_id}})"}' \
+            ${{ secrets.DISCORD_WEBHOOK_ACTION_FAILURE }}
+
+  publish:
+    runs-on: ubuntu-26.04
+    needs: summarize
+    if: ${{ !cancelled() && needs.summarize.result == 'success' && github.repository == 'hacs/integration' && !(inputs.dryRun == true || inputs.dryRun == 'true') }}
+    name: Publish ${{ matrix.category }} data
+    environment: ${{ fromJSON(needs.summarize.outputs.environments)[matrix.category] }}
+    strategy:
+      fail-fast: false
+      matrix:
+        category: ${{ fromJSON(needs.summarize.outputs.changedCategories) }}
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: ./.github/actions/setup-python
+        with:
+          requirements: requirements_generate_data.txt
+
+      - name: Download artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ matrix.category }}
+          path: outputdata
+
+      - name: Validate output with JQ
+        run: |
+          jq -c . outputdata/${{ matrix.category }}/data.json
+          jq -c . outputdata/${{ matrix.category }}/repositories.json
+
+      - name: Validate output with schema
+        run: |
+          python3 -m scripts.data.validate_category_data ${{ matrix.category }} outputdata/${{ matrix.category }}/data.json
+
+      - name: Upload to R2
+        run: |
+          aws s3 sync \
+            outputdata/${{ matrix.category }} \
+            s3://data-v2/${{ matrix.category }} \
+            --endpoint-url ${{ secrets.CF_R2_ENDPOINT_DATA }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.CF_R2_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
+
+      - name: Bust Cloudflare cache
+        run: |
+          curl --silent --show-error --fail -X POST \
+            "https://api.cloudflare.com/client/v4/zones/${{ secrets.CF_ZONE_ID }}/purge_cache" \
+            -H "Authorization: Bearer ${{ secrets.CF_BUST_CACHE_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            --data '{"files": ["https:\/\/data-v2.hacs.xyz\/${{ matrix.category }}\/data.json", "https:\/\/data-v2.hacs.xyz\/${{ matrix.category }}\/repositories.json"]}'
+
+  notify_on_failure:
+    runs-on: ubuntu-26.04
+    name: Trigger Discord notification when jobs fail
+    needs: ["generate-matrix", "settings", "fetch-stored-data", "category-data", "merge", "summarize", "publish"]
+    if: ${{ always() && github.repository == 'hacs/integration' && contains(join(needs.*.result, ','), 'failure') && github.event_name == 'schedule' }}
+    steps:
+      - name: Send notification
+        run: |
+          curl \
+            -H "Content-Type: application/json" \
+            -d '{"username": "GitHub action failure", "content": "[Scheduled action failed!](https://github.com/${{github.repository}}/actions/runs/${{github.run_id}})"}' \
+            ${{ secrets.DISCORD_WEBHOOK_ACTION_FAILURE }}

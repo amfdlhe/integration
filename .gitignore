@@ -1,19 +1,26 @@
-site
-.pytest*
+# artifacts
 __pycache__
-action/Test
-settings.json
-.devcontainer/configuration.yaml
-node_modules
-custom_components/custom_components
-manage/secrets.json
+.pytest*
 *.egg-info
-*/dist/*
 */build/*
+*/dist/*
 
-# dependencies
-/node_modules
+
+# misc
+.claude
 .coverage
+.venv
+.vscode
 coverage.xml
 htmlcov
+outputdata
+settings.json
 venv
+
+
+# Translation files
+custom_components/hacs/translations
+!custom_components/hacs/translations/en.json
+
+# Home Assistant configuration
+config
